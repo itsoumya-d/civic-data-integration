@@ -5,8 +5,41 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+import datetime
 from .enterprise_adapter import MuleSoftEnvelope, ResilientDeadLetterMediator, SAPS4HANAAssetAdapter
 from .pipeline import IntegrationPipeline
+from .project_orchestrator import (
+    IctProjectDeliveryOrchestrator,
+    ProjectStatus,
+    RiskSeverity,
+    SmeIntegrationPipelineManager,
+)
+
+
+class ProjectCreateIn(BaseModel):
+    client_name: str
+    project_type: str = "SYSTEMS_INTEGRATION"
+    hourly_rate_nzd: Optional[float] = 74.0
+    allocated_hours: Optional[float] = 160.0
+
+
+class MilestoneCreateIn(BaseModel):
+    name: str
+    target_date: datetime.date
+    deliverables: Optional[List[str]] = Field(default_factory=list)
+
+
+class RiskCreateIn(BaseModel):
+    category: str
+    description: str
+    severity: RiskSeverity = RiskSeverity.MEDIUM
+    mitigation_strategy: str
+
+
+class SmeReconcileIn(BaseModel):
+    crm_customers: List[Dict[str, Any]] = Field(default_factory=list)
+    finance_invoices: List[Dict[str, Any]] = Field(default_factory=list)
+    ops_jobs: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class IngestIn(BaseModel):
@@ -173,6 +206,88 @@ def create_app(pipeline: IntegrationPipeline | None = None) -> FastAPI:
                 for entry in state.audit
             ]
         }
+
+    orchestrator = IctProjectDeliveryOrchestrator()
+
+    @app.post("/api/v1/ict-projects/create")
+    def create_project(payload: ProjectCreateIn) -> dict[str, Any]:
+        p = orchestrator.create_project(
+            client_name=payload.client_name,
+            project_type=payload.project_type,
+            hourly_rate_nzd=payload.hourly_rate_nzd or 74.0,
+            allocated_hours=payload.allocated_hours or 160.0,
+        )
+        return {
+            "project_id": p.project_id,
+            "client_name": p.client_name,
+            "project_type": p.project_type,
+            "hourly_rate_nzd": p.hourly_rate_nzd,
+            "budget_total_nzd": p.budget_total_nzd,
+            "status": p.status.value,
+        }
+
+    @app.get("/api/v1/ict-projects/{project_id}")
+    def get_project(project_id: str) -> dict[str, Any]:
+        p = orchestrator.get_project(project_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return {
+            "project_id": p.project_id,
+            "client_name": p.client_name,
+            "project_type": p.project_type,
+            "hourly_rate_nzd": p.hourly_rate_nzd,
+            "budget_total_nzd": p.budget_total_nzd,
+            "hours_logged": p.hours_logged,
+            "cost_to_date_nzd": p.cost_to_date_nzd,
+            "status": p.status.value,
+            "overall_progress_percentage": p.overall_progress_percentage,
+            "milestones_count": len(p.milestones),
+            "risks_count": len(p.risk_register),
+        }
+
+    @app.post("/api/v1/ict-projects/{project_id}/milestones")
+    def add_milestone(project_id: str, payload: MilestoneCreateIn) -> dict[str, Any]:
+        m = orchestrator.add_milestone(
+            project_id=project_id,
+            name=payload.name,
+            target_date=payload.target_date,
+            deliverables=payload.deliverables,
+        )
+        if not m:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return {
+            "milestone_id": m.id,
+            "name": m.name,
+            "target_date": m.target_date.isoformat(),
+            "deliverables": m.deliverables,
+        }
+
+    @app.post("/api/v1/ict-projects/{project_id}/risks")
+    def add_risk(project_id: str, payload: RiskCreateIn) -> dict[str, Any]:
+        r = orchestrator.add_risk(
+            project_id=project_id,
+            category=payload.category,
+            description=payload.description,
+            severity=payload.severity,
+            mitigation_strategy=payload.mitigation_strategy,
+        )
+        if not r:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return {
+            "risk_id": r.id,
+            "category": r.category,
+            "description": r.description,
+            "severity": r.severity.value,
+            "mitigation_strategy": r.mitigation_strategy,
+        }
+
+    @app.post("/api/v1/integrations/sme/reconcile")
+    def reconcile_sme_data(payload: SmeReconcileIn) -> dict[str, Any]:
+        return SmeIntegrationPipelineManager.reconcile_tripartite_data(
+            crm_customers=payload.crm_customers,
+            finance_invoices=payload.finance_invoices,
+            ops_jobs=payload.ops_jobs,
+        )
 
     return app
 
