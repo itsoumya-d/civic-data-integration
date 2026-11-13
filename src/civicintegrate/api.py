@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 import datetime
 from .enterprise_adapter import MuleSoftEnvelope, ResilientDeadLetterMediator, SAPS4HANAAssetAdapter
+from .fabric_lakehouse import FabricLakehouseManager, SemanticMeasure
 from .pipeline import IntegrationPipeline
 from .project_orchestrator import (
     IctProjectDeliveryOrchestrator,
@@ -63,6 +64,45 @@ class MuleSoftPayloadIn(BaseModel):
     data: Dict[str, Any]
     status: Optional[str] = "SUCCESS"
     errors: Optional[List[str]] = Field(default_factory=list)
+
+
+class FabricLakehouseCreateIn(BaseModel):
+    workspace: str = "provoke-analytics-ws"
+    lakehouse_name: str = "provoke_lakehouse"
+
+
+class FabricBronzeIngestIn(BaseModel):
+    workspace: str = "provoke-analytics-ws"
+    lakehouse: str = "provoke_lakehouse"
+    table_name: str
+    records: List[Dict[str, Any]]
+    source_system: str = "CRM_FABRIC"
+
+
+class FabricSilverCurateIn(BaseModel):
+    workspace: str = "provoke-analytics-ws"
+    lakehouse: str = "provoke_lakehouse"
+    bronze_table: str
+    silver_table: str
+    dedupe_key: str
+    required_fields: Optional[List[str]] = None
+
+
+class FabricGoldAggregateIn(BaseModel):
+    workspace: str = "provoke-analytics-ws"
+    lakehouse: str = "provoke_lakehouse"
+    silver_table: str
+    gold_table: str
+    dimension_keys: List[str]
+    metric_column: str
+    aggregation: str = "sum"
+
+
+class FabricSemanticModelIn(BaseModel):
+    workspace: str = "provoke-analytics-ws"
+    lakehouse: str = "provoke_lakehouse"
+    model_name: str = "FabricDirectLakeModel"
+    tables: List[str]
 
 
 def _summary(summary) -> dict[str, Any]:
@@ -288,6 +328,89 @@ def create_app(pipeline: IntegrationPipeline | None = None) -> FastAPI:
             finance_invoices=payload.finance_invoices,
             ops_jobs=payload.ops_jobs,
         )
+
+    fabric_mgr = FabricLakehouseManager()
+
+    @app.post("/api/v1/fabric/lakehouses")
+    def create_fabric_lakehouse(payload: FabricLakehouseCreateIn) -> dict[str, Any]:
+        return fabric_mgr.create_lakehouse(payload.workspace, payload.lakehouse_name)
+
+    @app.get("/api/v1/fabric/lakehouses/{workspace}/{lakehouse}/tables")
+    def list_fabric_tables(workspace: str, lakehouse: str) -> dict[str, Any]:
+        return {
+            "workspace": workspace,
+            "lakehouse": lakehouse,
+            "tables": fabric_mgr.list_tables(workspace, lakehouse),
+        }
+
+    @app.post("/api/v1/fabric/medallion/bronze")
+    def ingest_fabric_bronze(payload: FabricBronzeIngestIn) -> dict[str, Any]:
+        count, commit = fabric_mgr.ingest_bronze(
+            workspace=payload.workspace,
+            lakehouse=payload.lakehouse,
+            table_name=payload.table_name,
+            records=payload.records,
+            source_system=payload.source_system,
+        )
+        return {
+            "ingested_count": count,
+            "table": payload.table_name,
+            "version": commit.version,
+            "commit_sha": commit.commit_sha,
+        }
+
+    @app.post("/api/v1/fabric/medallion/silver")
+    def curate_fabric_silver(payload: FabricSilverCurateIn) -> dict[str, Any]:
+        clean_count, rejected_count, commit = fabric_mgr.transform_silver(
+            workspace=payload.workspace,
+            lakehouse=payload.lakehouse,
+            bronze_table=payload.bronze_table,
+            silver_table=payload.silver_table,
+            dedupe_key=payload.dedupe_key,
+            required_fields=payload.required_fields,
+        )
+        return {
+            "clean_count": clean_count,
+            "rejected_count": rejected_count,
+            "table": payload.silver_table,
+            "version": commit.version,
+            "commit_sha": commit.commit_sha,
+        }
+
+    @app.post("/api/v1/fabric/medallion/gold")
+    def aggregate_fabric_gold(payload: FabricGoldAggregateIn) -> dict[str, Any]:
+        gold_count, commit = fabric_mgr.build_gold_mart(
+            workspace=payload.workspace,
+            lakehouse=payload.lakehouse,
+            silver_table=payload.silver_table,
+            gold_table=payload.gold_table,
+            dimension_keys=payload.dimension_keys,
+            metric_column=payload.metric_column,
+            aggregation=payload.aggregation,
+        )
+        return {
+            "gold_groups_count": gold_count,
+            "table": payload.gold_table,
+            "version": commit.version,
+            "commit_sha": commit.commit_sha,
+        }
+
+    @app.post("/api/v1/fabric/semantic-models/directlake")
+    def create_directlake_semantic_model(payload: FabricSemanticModelIn) -> dict[str, Any]:
+        model = fabric_mgr.generate_directlake_model(
+            workspace=payload.workspace,
+            lakehouse=payload.lakehouse,
+            model_name=payload.model_name,
+            tables=payload.tables,
+        )
+        return {
+            "model_name": model.model_name,
+            "workspace": model.workspace,
+            "lakehouse": model.lakehouse_source,
+            "mode": model.mode,
+            "tables": model.tables,
+            "tmdl_definition": model.to_tmdl(),
+        }
 
     return app
 
